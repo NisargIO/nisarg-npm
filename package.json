@@ -2,7 +2,11 @@
   "name": "nisarg",
   "module": "index.ts",
   "type": "module",
-  "version": "0.0.0",
+  "version": "0.0.2",
+  "exports": {
+    ".": "./index.ts",
+    "./rpc": "./src/rpc/src/index.ts"
+  },
   "scripts": {
     "format": "prettier --write .",
     "format:check": "prettier --check .",
