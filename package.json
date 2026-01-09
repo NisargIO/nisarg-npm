@@ -3,13 +3,21 @@
   "module": "index.ts",
   "type": "module",
   "version": "0.0.0",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "prettier": "^3.7.4"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
+    "vitest": "^4.0.16",
     "zod": "^4.1.12",
     "zustand": "^5.0.9"
   }

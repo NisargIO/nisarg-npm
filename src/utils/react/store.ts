@@ -11,11 +11,9 @@ export const club = {
   },
 };
 
-const RepogrepStore = club
-  .state({ id: "", name: "" })
-  .actions((set) => ({
-    setId: (id: string) => set({ id }),
-    setName: (name: string) => set({ name }),
-  }));
+const RepogrepStore = club.state({ id: "", name: "" }).actions((set) => ({
+  setId: (id: string) => set({ id }),
+  setName: (name: string) => set({ name }),
+}));
 
 RepogrepStore;

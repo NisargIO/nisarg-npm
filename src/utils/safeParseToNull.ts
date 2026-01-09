@@ -15,10 +15,10 @@ export const safeParseToNull =
     return result.success ? result.data : null;
   };
 
-  
 export const FailedToParseSymbol = Symbol("failed_to_parse");
 
-export const safeParseToSymbol = <T extends z.ZodTypeAny>(schema: T) =>
+export const safeParseToSymbol =
+  <T extends z.ZodTypeAny>(schema: T) =>
   (value: unknown) => {
     const result = schema.optional().safeParse(value);
     return result.success ? result.data! : FailedToParseSymbol;
