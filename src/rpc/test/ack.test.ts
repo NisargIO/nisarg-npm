@@ -1,11 +1,19 @@
 import type * as Alice from "./alice";
 import { MessageChannel } from "node:worker_threads";
-import { expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBirpc } from "../src/main";
 import * as Bob from "./bob";
 
 type AliceFunctions = typeof Alice;
 type BobFunctions = typeof Bob;
+
+// Layered function types for ack tests
+interface LayeredFunctions {
+  api: {
+    getData(): string;
+    slowCall(): string;
+  };
+}
 
 it("ack timeout rejects when no receiver", async () => {
   const channel = new MessageChannel();
@@ -321,4 +329,91 @@ it("ack received before timeout clears ack timer", async () => {
   // ACK timeout should NOT have been called
   expect(onAckTimeout).not.toHaveBeenCalled();
   expect(result).toBe("Hello Bob");
+});
+
+describe("layered API ack", () => {
+  it("ack timeout on layered call when no receiver", async () => {
+    const channel = new MessageChannel();
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port1.postMessage(data),
+        on: (fn) => channel.port1.on("message", fn),
+        ackTimeout: 100,
+        timeout: 5000,
+      },
+    );
+
+    try {
+      await client.api.getData();
+      expect.fail("Should have thrown ack timeout error");
+    } catch (e) {
+      expect((e as Error).message).toContain("ack timeout");
+      expect((e as Error).message).toContain("api.getData");
+    }
+  });
+
+  it("ack works correctly with layered calls", async () => {
+    const channel = new MessageChannel();
+
+    const serverFunctions = {
+      api: {
+        getData() {
+          return "layered-data";
+        },
+        slowCall: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return "slow-result";
+        },
+      },
+    };
+
+    const _server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+    });
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+        ackTimeout: 1000,
+        timeout: 5000,
+      },
+    );
+
+    const result = await client.api.getData();
+    expect(result).toBe("layered-data");
+  });
+
+  it("custom onAckTimeoutError with layered call", async () => {
+    const channel = new MessageChannel();
+    const onAckTimeout = vi.fn();
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port1.postMessage(data),
+        on: (fn) => channel.port1.on("message", fn),
+        ackTimeout: 100,
+        onAckTimeoutError(functionName, args) {
+          onAckTimeout({ functionName, args });
+          throw new Error("Custom layered ack timeout");
+        },
+      },
+    );
+
+    try {
+      await client.api.getData();
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(onAckTimeout).toHaveBeenCalledWith({
+        functionName: "api.getData",
+        args: [],
+      });
+      expect((e as Error).message).toBe("Custom layered ack timeout");
+    }
+  });
 });

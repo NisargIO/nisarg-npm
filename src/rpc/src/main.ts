@@ -264,9 +264,21 @@ export interface BirpcReturnBuiltin<
   ) => AsyncIterable<any>;
 }
 
+/**
+ * Recursively proxify remote functions, supporting nested namespaces.
+ * Functions become BirpcFn, nested objects become recursively proxified.
+ */
 export type ProxifiedRemoteFunctions<
   RemoteFunctions extends object = Record<string, unknown>,
-> = { [K in keyof RemoteFunctions]: BirpcFn<RemoteFunctions[K]> };
+> = {
+  [K in keyof RemoteFunctions]: RemoteFunctions[K] extends (
+    ...args: any[]
+  ) => any
+    ? BirpcFn<RemoteFunctions[K]>
+    : RemoteFunctions[K] extends object
+      ? ProxifiedRemoteFunctions<RemoteFunctions[K]>
+      : BirpcFn<RemoteFunctions[K]>;
+};
 
 export type BirpcReturn<
   RemoteFunctions extends object = Record<string, unknown>,
@@ -311,6 +323,61 @@ const defaultDeserialize = defaultSerialize;
 
 // Store public APIs locally in case they are overridden later
 const { clearTimeout, setTimeout } = globalThis;
+
+/**
+ * Create a callable proxy that supports nested property access for layered RPC calls.
+ * e.g., rpc.user.getToken() will call "user.getToken" on the remote
+ */
+const createMethodProxy = (
+  path: string,
+  _call: (method: string, args: unknown[], event?: boolean) => any,
+  _callStream: (method: string, args: unknown[]) => any,
+  eventNames: string[],
+): any => {
+  const sendEvent = (...args: any[]) => _call(path, args, true);
+  const sendStream = (...args: any[]) => _callStream(path, args);
+  const sendCall = (...args: any[]) => _call(path, args, false);
+
+  // Determine if this path is configured as an event
+  const isEvent = eventNames.includes(path as any);
+  const fn = isEvent ? sendEvent : sendCall;
+
+  // Return a proxy that:
+  // - Can be called as a function (fn(...args))
+  // - Supports nested property access (fn.subMethod)
+  return new Proxy(fn, {
+    get(_, prop: string) {
+      if (prop === "asEvent") return sendEvent;
+      if (prop === "asStream") return sendStream;
+      // Handle Promise-like behavior (e.g., await rpc.user)
+      if (prop === "then") return undefined;
+      // For nested access, build new path: "user" + "getToken" = "user.getToken"
+      return createMethodProxy(
+        `${path}.${prop}`,
+        _call,
+        _callStream,
+        eventNames,
+      );
+    },
+  });
+}
+
+/**
+ * Resolve a function by traversing a dotted path in a nested object.
+ * e.g., resolveNestedFunction({ user: { getToken: fn } }, "user.getToken") => fn
+ */
+const resolveNestedFunction = (
+  functions: object,
+  path: string,
+): ((...args: any[]) => any) | undefined => {
+  const parts = path.split(".");
+  let current: any = functions;
+  for (const part of parts) {
+    if (current == null) return undefined;
+    current = current[part];
+  }
+  return typeof current === "function" ? current : undefined;
+}
 
 export function createBirpc<
   RemoteFunctions extends object = Record<string, unknown>,
@@ -668,17 +735,13 @@ export function createBirpc<
           )
             return undefined;
 
-          const sendEvent = (...args: any[]) => _call(method, args, true);
-          const sendStream = (...args: any[]) => _callStream(method, args);
-          if (eventNames.includes(method as any)) {
-            sendEvent.asEvent = sendEvent;
-            sendEvent.asStream = sendStream;
-            return sendEvent;
-          }
-          const sendCall = (...args: any[]) => _call(method, args, false);
-          sendCall.asEvent = sendEvent;
-          sendCall.asStream = sendStream;
-          return sendCall;
+          // Return a recursive proxy that supports layered calls like rpc.user.getToken()
+          return createMethodProxy(
+            method,
+            _call,
+            _callStream,
+            eventNames as string[],
+          );
         },
       },
     ) as BirpcReturn<RemoteFunctions, LocalFunctions, Proxify>;
@@ -767,9 +830,11 @@ export function createBirpc<
       }
 
       let result, error: any;
+      // Resolve nested function by path (e.g., "user.getToken" => $functions.user.getToken)
+      const resolvedFn = resolveNestedFunction($functions as object, method);
       let fn = await (resolver
-        ? resolver.call(rpc, method, ($functions as any)[method])
-        : ($functions as any)[method]);
+        ? resolver.call(rpc, method, resolvedFn as any)
+        : resolvedFn);
 
       if (optional) fn ||= () => undefined;
 

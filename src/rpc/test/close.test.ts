@@ -1,6 +1,13 @@
 import { nextTick } from "node:process";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBirpc } from "../src/main";
+
+// Layered function types for close tests
+interface LayeredFunctions {
+  service: {
+    slowOperation(): string;
+  };
+}
 
 it("stops the rpc promises", async () => {
   expect.assertions(4);
@@ -87,4 +94,56 @@ it("custom error's cause is not overwritten", async () => {
     rpc.$close(error);
   });
   await promise;
+});
+
+describe("layered API close", () => {
+  it("stops layered rpc promises", async () => {
+    expect.assertions(2);
+    const rpc = createBirpc<LayeredFunctions>(
+      {},
+      {
+        on() {},
+        post() {},
+      },
+    );
+
+    const promise = rpc.service.slowOperation().then(
+      () => {
+        throw new Error("Promise should not resolve");
+      },
+      (err) => {
+        expect(err.message).toBe(
+          '[birpc] rpc is closed, cannot call "service.slowOperation"',
+        );
+      },
+    );
+
+    nextTick(() => {
+      rpc.$close();
+    });
+
+    await promise;
+    expect(rpc.$closed).toBe(true);
+  });
+
+  it("closed rpc rejects layered calls", async () => {
+    const rpc = createBirpc<LayeredFunctions>(
+      {},
+      {
+        on() {},
+        post() {},
+      },
+    );
+
+    rpc.$close();
+
+    try {
+      await rpc.service.slowOperation();
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect((e as Error).message).toBe(
+        '[birpc] rpc is closed, cannot call "service.slowOperation"',
+      );
+    }
+  });
 });

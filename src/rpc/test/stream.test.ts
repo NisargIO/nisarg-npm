@@ -1,5 +1,5 @@
 import { MessageChannel } from "node:worker_threads";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBirpc } from "../src/main";
 
 interface StreamFunctions {
@@ -11,6 +11,16 @@ interface StreamFunctions {
 }
 
 interface EmptyFunctions {}
+
+// Layered stream function types
+interface LayeredStreamFunctions {
+  data: {
+    streamNumbers(count: number): AsyncIterable<number>;
+    nested: {
+      streamValues(values: number[]): AsyncIterable<number>;
+    };
+  };
+}
 
 function createStreamChannel() {
   const channel = new MessageChannel();
@@ -617,4 +627,116 @@ it("reusing stream after completion", async () => {
     results2.push(value as number);
   }
   expect(results2).toEqual([0, 1, 2, 3, 4]);
+});
+
+describe("layered API streaming", () => {
+  function createLayeredStreamChannel() {
+    const channel = new MessageChannel();
+
+    const serverFunctions = {
+      data: {
+        async *streamNumbers(count: number) {
+          for (let i = 0; i < count; i++) {
+            yield i;
+          }
+        },
+        nested: {
+          async *streamValues(values: number[]) {
+            for (const v of values) {
+              yield v;
+            }
+          },
+        },
+      },
+    };
+
+    const server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+    });
+
+    const client = createBirpc<LayeredStreamFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+      },
+    );
+
+    return { channel, server, client };
+  }
+
+  it("stream with layered path using $callStream", async () => {
+    const { client } = createLayeredStreamChannel();
+
+    const results: number[] = [];
+    // @ts-expect-error - $callStream expects flat keys
+    for await (const value of client.$callStream("data.streamNumbers", 5)) {
+      results.push(value as number);
+    }
+
+    expect(results).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("stream with layered path using asStream", async () => {
+    const { client } = createLayeredStreamChannel();
+
+    const results: number[] = [];
+    for await (const value of client.data.streamNumbers.asStream(4)) {
+      results.push(value as number);
+    }
+
+    expect(results).toEqual([0, 1, 2, 3]);
+  });
+
+  it("deeply nested stream", async () => {
+    const { client } = createLayeredStreamChannel();
+
+    const results: number[] = [];
+    for await (const value of client.data.nested.streamValues.asStream([
+      10, 20, 30,
+    ])) {
+      results.push(value as number);
+    }
+
+    expect(results).toEqual([10, 20, 30]);
+  });
+
+  it("layered stream early termination", async () => {
+    const { client } = createLayeredStreamChannel();
+
+    const results: number[] = [];
+    for await (const value of client.data.streamNumbers.asStream(100)) {
+      results.push(value as number);
+      if (results.length >= 3) break;
+    }
+
+    expect(results).toEqual([0, 1, 2]);
+  });
+
+  it("multiple concurrent layered streams", async () => {
+    const { client } = createLayeredStreamChannel();
+
+    const results1: number[] = [];
+    const results2: number[] = [];
+
+    const stream1 = (async () => {
+      for await (const v of client.data.streamNumbers.asStream(3)) {
+        results1.push(v as number);
+      }
+    })();
+
+    const stream2 = (async () => {
+      for await (const v of client.data.nested.streamValues.asStream([
+        100, 200,
+      ])) {
+        results2.push(v as number);
+      }
+    })();
+
+    await Promise.all([stream1, stream2]);
+
+    expect(results1).toEqual([0, 1, 2]);
+    expect(results2).toEqual([100, 200]);
+  });
 });

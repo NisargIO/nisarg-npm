@@ -1,11 +1,21 @@
 import { MessageChannel } from "node:worker_threads";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBirpc } from "../src/main";
 import * as Alice from "./alice";
 import * as Bob from "./bob";
 
 type BobFunctions = typeof Bob;
 type AliceFunctions = typeof Alice;
+
+// Layered function types for error tests
+interface LayeredServerFunctions {
+  service: {
+    getData(): string;
+    nested: {
+      deepCall(): string;
+    };
+  };
+}
 
 it("on function error", async () => {
   const channel = new MessageChannel();
@@ -179,4 +189,85 @@ it("on async post error", async () => {
     expect(e).toStrictEqual(error);
     expect(e).toMatchInlineSnapshot(`[Error: Custom async post error]`);
   }
+});
+
+describe("layered API errors", () => {
+  it("on function error with layered path", async () => {
+    const channel = new MessageChannel();
+
+    let error: any;
+
+    const serverFunctions = {
+      service: {
+        getData() {
+          return "data";
+        },
+        nested: {
+          deepCall() {
+            return "deep";
+          },
+        },
+      },
+    };
+
+    const _server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+      onFunctionError(err, method, args) {
+        error = { err, method, args };
+      },
+    });
+
+    const client = createBirpc<LayeredServerFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+      },
+    );
+
+    try {
+      // @ts-expect-error - nonexistent is not defined
+      await client.service.nonexistent();
+    } catch {}
+
+    expect(error.method).toBe("service.nonexistent");
+    expect(error.err.message).toBe(
+      '[birpc] function "service.nonexistent" not found',
+    );
+  });
+
+  it("deeply nested function not found error", async () => {
+    const channel = new MessageChannel();
+
+    const serverFunctions = {
+      service: {
+        getData() {
+          return "data";
+        },
+      },
+    };
+
+    const _server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+    });
+
+    const client = createBirpc<LayeredServerFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+      },
+    );
+
+    try {
+      await client.service.nested.deepCall();
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect((e as Error).message).toBe(
+        '[birpc] function "service.nested.deepCall" not found',
+      );
+    }
+  });
 });

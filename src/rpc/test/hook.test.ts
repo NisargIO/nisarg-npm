@@ -1,12 +1,19 @@
 import type { EventOptions } from "../src";
 import { MessageChannel } from "node:worker_threads";
-import { expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBirpc } from "../src/main";
 import * as Alice from "./alice";
 import * as Bob from "./bob";
 
 type BobFunctions = typeof Bob;
 type AliceFunctions = typeof Alice;
+
+// Layered function types for hook tests
+interface LayeredFunctions {
+  api: {
+    getData(key: string): string;
+  };
+}
 
 const mockFn = {
   trigger() {},
@@ -72,4 +79,90 @@ it("cache", async () => {
       "getCount-" => 0,
     }
   `);
+});
+
+describe("layered API hooks", () => {
+  it("onRequest hook with layered calls", async () => {
+    const channel = new MessageChannel();
+    const onRequestSpy = vi.fn();
+
+    const serverFunctions = {
+      api: {
+        getData(key: string) {
+          return `value-for-${key}`;
+        },
+      },
+    };
+
+    const _server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+    });
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+        onRequest: async (req, next) => {
+          onRequestSpy(req.m, req.a);
+          return next();
+        },
+      },
+    );
+
+    const result = await client.api.getData("test-key");
+    expect(result).toBe("value-for-test-key");
+    expect(onRequestSpy).toHaveBeenCalledWith("api.getData", ["test-key"]);
+  });
+
+  it("cache with layered calls", async () => {
+    const channel = new MessageChannel();
+    const callSpy = vi.fn();
+
+    const serverFunctions = {
+      api: {
+        getData(key: string) {
+          callSpy(key);
+          return `data-${key}`;
+        },
+      },
+    };
+
+    const _server = createBirpc<{}, typeof serverFunctions>(serverFunctions, {
+      post: (data) => channel.port1.postMessage(data),
+      on: (fn) => channel.port1.on("message", fn),
+    });
+
+    const cacheMap = new Map<string, any>();
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port2.postMessage(data),
+        on: (fn) => channel.port2.on("message", fn),
+        onRequest: async (req, next, send) => {
+          const cacheKey = `${req.m}-${req.a?.join("-")}`;
+          if (cacheMap.has(cacheKey)) {
+            send(cacheMap.get(cacheKey));
+          } else {
+            const result = await next();
+            cacheMap.set(cacheKey, result);
+          }
+        },
+      },
+    );
+
+    // First call - hits server
+    expect(await client.api.getData("key1")).toBe("data-key1");
+    expect(callSpy).toHaveBeenCalledTimes(1);
+
+    // Second call with same args - uses cache
+    expect(await client.api.getData("key1")).toBe("data-key1");
+    expect(callSpy).toHaveBeenCalledTimes(1);
+
+    // Different key - hits server again
+    expect(await client.api.getData("key2")).toBe("data-key2");
+    expect(callSpy).toHaveBeenCalledTimes(2);
+  });
 });

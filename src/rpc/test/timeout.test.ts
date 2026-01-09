@@ -1,11 +1,18 @@
 import type * as Alice from "./alice";
 import { MessageChannel } from "node:worker_threads";
-import { expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBirpc } from "../src/main";
 import * as Bob from "./bob";
 
 type AliceFunctions = typeof Alice;
 type BobFunctions = typeof Bob;
+
+// Layered function types for timeout tests
+interface LayeredFunctions {
+  api: {
+    slowCall(): string;
+  };
+}
 
 it("timeout", async () => {
   const channel = new MessageChannel();
@@ -77,4 +84,57 @@ it("custom onTimeoutError without custom error", async () => {
       `[Error: [birpc] timeout on calling "hello"]`,
     );
   }
+});
+
+describe("layered API timeout", () => {
+  it("timeout on layered call", async () => {
+    const channel = new MessageChannel();
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port1.postMessage(data),
+        on: (fn) => channel.port1.on("message", fn),
+        timeout: 100,
+      },
+    );
+
+    try {
+      await client.api.slowCall();
+      expect.fail("Should have thrown timeout error");
+    } catch (e) {
+      expect((e as Error).message).toBe(
+        '[birpc] timeout on calling "api.slowCall"',
+      );
+    }
+  });
+
+  it("custom onTimeoutError with layered call", async () => {
+    const channel = new MessageChannel();
+    const onTimeout = vi.fn();
+
+    const client = createBirpc<LayeredFunctions, {}>(
+      {},
+      {
+        post: (data) => channel.port1.postMessage(data),
+        on: (fn) => channel.port1.on("message", fn),
+        timeout: 100,
+        onTimeoutError(functionName, args) {
+          onTimeout({ functionName, args });
+          throw new Error("Custom layered timeout error");
+        },
+      },
+    );
+
+    try {
+      await client.api.slowCall();
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(onTimeout).toHaveBeenCalledWith({
+        functionName: "api.slowCall",
+        args: [],
+      });
+      expect((e as Error).message).toBe("Custom layered timeout error");
+    }
+  });
 });

@@ -1,5 +1,5 @@
 import { MessageChannel } from "node:worker_threads";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBirpcGroup } from "../src/group";
 import { createBirpc } from "../src/main";
 import * as Alice from "./alice";
@@ -7,6 +7,19 @@ import * as Bob from "./bob";
 
 type BobFunctions = typeof Bob;
 type AliceFunctions = typeof Alice;
+
+// Layered function types for group tests
+interface LayeredServerFunctions {
+  api: {
+    getData(): string;
+  };
+}
+
+interface LayeredClientFunctions {
+  client: {
+    notify(message: string): string;
+  };
+}
 
 it("group", async () => {
   const channel1 = new MessageChannel();
@@ -286,4 +299,121 @@ it("group without proxify", async () => {
   expect(await client3.$call("hello", "Bob")).toEqual(
     "Hello Bob, my name is Alice",
   );
+});
+
+describe("layered API group", () => {
+  it("group with layered functions", async () => {
+    const channel1 = new MessageChannel();
+    const channel2 = new MessageChannel();
+
+    const serverFunctions = {
+      api: {
+        getData() {
+          return "server-data";
+        },
+      },
+    };
+
+    const clientFunctions = {
+      client: {
+        notify(message: string) {
+          return `Received: ${message}`;
+        },
+      },
+    };
+
+    const client1 = createBirpc<
+      typeof serverFunctions,
+      typeof clientFunctions
+    >(clientFunctions, {
+      post: (data) => channel1.port1.postMessage(data),
+      on: (fn) => channel1.port1.on("message", fn),
+    });
+
+    const client2 = createBirpc<
+      typeof serverFunctions,
+      typeof clientFunctions
+    >(clientFunctions, {
+      post: (data) => channel2.port1.postMessage(data),
+      on: (fn) => channel2.port1.on("message", fn),
+    });
+
+    const server = createBirpcGroup<
+      typeof clientFunctions,
+      typeof serverFunctions
+    >(serverFunctions, [
+      {
+        post: (data) => channel1.port2.postMessage(data),
+        on: (fn) => channel1.port2.on("message", fn),
+      },
+      {
+        post: (data) => channel2.port2.postMessage(data),
+        on: (fn) => channel2.port2.on("message", fn),
+      },
+    ]);
+
+    // Clients call layered server function
+    expect(await client1.api.getData()).toBe("server-data");
+    expect(await client2.api.getData()).toBe("server-data");
+
+    // Server broadcasts to layered client functions
+    const results = await server.broadcast.client.notify("Hello all");
+    expect(results).toEqual(["Received: Hello all", "Received: Hello all"]);
+  });
+
+  it("group broadcast with $call on layered path", async () => {
+    const channel1 = new MessageChannel();
+    const channel2 = new MessageChannel();
+
+    const serverFunctions = {
+      api: {
+        getData() {
+          return "data";
+        },
+      },
+    };
+
+    const clientFunctions = {
+      client: {
+        notify(message: string) {
+          return `Got: ${message}`;
+        },
+      },
+    };
+
+    const _client1 = createBirpc<
+      typeof serverFunctions,
+      typeof clientFunctions
+    >(clientFunctions, {
+      post: (data) => channel1.port1.postMessage(data),
+      on: (fn) => channel1.port1.on("message", fn),
+    });
+
+    const _client2 = createBirpc<
+      typeof serverFunctions,
+      typeof clientFunctions
+    >(clientFunctions, {
+      post: (data) => channel2.port1.postMessage(data),
+      on: (fn) => channel2.port1.on("message", fn),
+    });
+
+    const server = createBirpcGroup<
+      typeof clientFunctions,
+      typeof serverFunctions
+    >(serverFunctions, [
+      {
+        post: (data) => channel1.port2.postMessage(data),
+        on: (fn) => channel1.port2.on("message", fn),
+      },
+      {
+        post: (data) => channel2.port2.postMessage(data),
+        on: (fn) => channel2.port2.on("message", fn),
+      },
+    ]);
+
+    // Use $call with dot notation for layered functions
+    // @ts-expect-error - $call expects flat keys
+    const results = await server.broadcast.$call("client.notify", "Test");
+    expect(results).toEqual(["Got: Test", "Got: Test"]);
+  });
 });

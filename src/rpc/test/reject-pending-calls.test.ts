@@ -1,5 +1,12 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createBirpc } from "../src/main";
+
+// Layered function types for reject-pending-calls tests
+interface LayeredFunctions {
+  service: {
+    pendingCall(): Promise<void>;
+  };
+}
 
 it("rejects pending calls", async () => {
   const rpc = createBirpc<{
@@ -102,4 +109,52 @@ it("rejected calls are cleared from rpc", async () => {
     );
     expect(rejections).toHaveLength(0);
   }
+});
+
+describe("layered API reject pending calls", () => {
+  it("rejects layered pending calls", async () => {
+    const rpc = createBirpc<LayeredFunctions>(
+      {},
+      {
+        on() {},
+        post() {},
+      },
+    );
+
+    const promise = rpc.service
+      .pendingCall()
+      .then(() => expect.fail("Should not resolve"))
+      .catch((error) => error);
+
+    const rejections = rpc.$rejectPendingCalls();
+    expect(rejections).toHaveLength(1);
+
+    const error = await promise;
+    expect(error.message).toBe(
+      '[birpc]: rejected pending call "service.pendingCall".',
+    );
+  });
+
+  it("rejects layered pending calls with custom handler", async () => {
+    const rpc = createBirpc<LayeredFunctions>(
+      {},
+      {
+        on() {},
+        post() {},
+      },
+    );
+
+    const promise = rpc.service
+      .pendingCall()
+      .then(() => expect.fail("Should not resolve"))
+      .catch((error) => error);
+
+    const rejections = rpc.$rejectPendingCalls(({ method, reject }) =>
+      reject(new Error(`Custom rejection for "${method}"`)),
+    );
+    expect(rejections).toHaveLength(1);
+
+    const error = await promise;
+    expect(error.message).toBe('Custom rejection for "service.pendingCall"');
+  });
 });

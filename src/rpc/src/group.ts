@@ -105,23 +105,41 @@ export function createBirpcGroup<
     $callRaw: (options: CallRawOptions) => _boardcast(options),
   } as unknown as BirpcGroupReturnBuiltin<RemoteFunctions>;
 
+  /**
+   * Create a recursive proxy for broadcast that supports layered calls like
+   * broadcast.client.notify() which will call "client.notify" on all clients.
+   */
+  function createBroadcastMethodProxy(path: string): any {
+    const sendCall = (...args: any[]) => {
+      return _boardcast({ method: path, args, event: false });
+    };
+    sendCall.asEvent = async (...args: any[]) => {
+      await _boardcast({ method: path, args, event: true });
+    };
+
+    return new Proxy(sendCall, {
+      get(target, prop: string) {
+        if (prop === "asEvent") return target.asEvent;
+        if (prop === "then") return undefined;
+        // For nested access, build new path: "client" + "notify" = "client.notify"
+        return createBroadcastMethodProxy(`${path}.${prop}`);
+      },
+    });
+  }
+
   const broadcastProxy = proxify
     ? (new Proxy(
         {},
         {
-          get(_, method) {
+          get(_, method: string) {
             if (Object.prototype.hasOwnProperty.call(broadcastBuiltin, method))
               return (broadcastBuiltin as any)[method];
 
-            const client = getClients();
-            const callbacks = client.map((c) => (c as any)[method]);
-            const sendCall = (...args: any[]) => {
-              return Promise.all(callbacks.map((i) => i(...args)));
-            };
-            sendCall.asEvent = async (...args: any[]) => {
-              await Promise.all(callbacks.map((i) => i.asEvent(...args)));
-            };
-            return sendCall;
+            // Handle Promise-like behavior
+            if (method === "then") return undefined;
+
+            // Return a recursive proxy that supports layered calls
+            return createBroadcastMethodProxy(method);
           },
         },
       ) as BirpcGroupReturn<RemoteFunctions, Proxify>)
