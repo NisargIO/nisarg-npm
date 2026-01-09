@@ -1,7 +1,22 @@
-import type { RpcMessage, RpcRequest, RpcResponse } from "./messages";
+import type {
+  RpcAck,
+  RpcMessage,
+  RpcRequest,
+  RpcResponse,
+  RpcStreamEnd,
+  RpcStreamError,
+  RpcStreamNext,
+} from "./messages";
 import type { ArgumentsType, ReturnType, Thenable } from "./utils";
-import { TYPE_REQUEST, TYPE_RESPONSE } from "./messages";
-import { createPromiseWithResolvers, nanoid } from "./utils";
+import {
+  TYPE_ACK,
+  TYPE_REQUEST,
+  TYPE_RESPONSE,
+  TYPE_STREAM_END,
+  TYPE_STREAM_ERROR,
+  TYPE_STREAM_NEXT,
+} from "./messages";
+import { createPromiseWithResolvers, isAsyncIterable, nanoid } from "./utils";
 
 export type PromisifyFn<T> =
   ReturnType<T> extends Promise<any>
@@ -136,6 +151,26 @@ export interface EventOptions<
     functionName: string,
     args: any[],
   ) => boolean | void;
+
+  /**
+   * Timeout for receiving acknowledgment that message was received (ms).
+   * If set, the receiver will send an ACK immediately upon receiving the request,
+   * and the caller will reject if no ACK is received within this time.
+   *
+   * @default undefined (no ack required)
+   */
+  ackTimeout?: number;
+
+  /**
+   * Custom error handler for ack timeouts
+   *
+   * @returns `true` to prevent the error from being thrown
+   */
+  onAckTimeoutError?: (
+    this: BirpcReturn<RemoteFunctions, LocalFunctions, Proxify>,
+    functionName: string,
+    args: any[],
+  ) => boolean | void;
 }
 
 export type BirpcOptions<
@@ -144,11 +179,25 @@ export type BirpcOptions<
   Proxify extends boolean = true,
 > = EventOptions<RemoteFunctions, LocalFunctions, Proxify> & ChannelOptions;
 
+/**
+ * Extract the yielded type from an async iterable
+ */
+export type AsyncIterableYield<T> =
+  T extends AsyncIterable<infer U> ? U : never;
+
 export type BirpcFn<T> = PromisifyFn<T> & {
   /**
    * Send event without asking for response
    */
   asEvent: (...args: ArgumentsType<T>) => Promise<void>;
+  /**
+   * Call the function and return results as an async iterable stream
+   */
+  asStream: (
+    ...args: ArgumentsType<T>
+  ) => AsyncIterable<
+    ReturnType<T> extends AsyncIterable<infer U> ? U : Awaited<ReturnType<T>>
+  >;
 };
 
 export interface BirpcReturnBuiltin<
@@ -206,6 +255,13 @@ export interface BirpcReturnBuiltin<
     event?: boolean;
     optional?: boolean;
   }) => Promise<Awaited<ReturnType<any>>[]>;
+  /**
+   * Call a remote function that returns an async iterator and stream the results.
+   */
+  $callStream: <K extends keyof RemoteFunctions>(
+    method: K,
+    ...args: ArgumentsType<RemoteFunctions[K]>
+  ) => AsyncIterable<any>;
 }
 
 export type ProxifiedRemoteFunctions<
@@ -236,6 +292,15 @@ interface PromiseEntry {
   resolve: (arg: any) => void;
   reject: (error: any) => void;
   method: string;
+  ackTimeoutId?: ReturnType<typeof setTimeout>;
+  responseTimeoutId?: ReturnType<typeof setTimeout>;
+  ackReceived?: boolean;
+}
+
+interface StreamEntry {
+  push: (value: any) => void;
+  end: () => void;
+  error: (e: any) => void;
   timeoutId?: ReturnType<typeof setTimeout>;
 }
 
@@ -265,14 +330,44 @@ export function createBirpc<
     resolver,
     bind = "rpc",
     timeout = DEFAULT_TIMEOUT,
+    ackTimeout,
     proxify = true,
   } = options;
 
   let $closed = false;
 
   const _rpcPromiseMap = new Map<string, PromiseEntry>();
+  const _streamMap = new Map<string, StreamEntry>();
   let _promiseInit: Promise<any> | any;
   let rpc: BirpcReturn<RemoteFunctions, LocalFunctions, Proxify>;
+
+  function startResponseTimeout(
+    id: string,
+    method: string,
+    args: unknown[],
+    reject: (error: any) => void,
+  ) {
+    if (timeout < 0) return undefined;
+
+    let responseTimeoutId: ReturnType<typeof setTimeout> | undefined =
+      setTimeout(() => {
+        try {
+          const handleResult = options.onTimeoutError?.call(rpc, method, args);
+          if (handleResult !== true)
+            throw new Error(`[birpc] timeout on calling "${method}"`);
+        } catch (e) {
+          reject(e);
+        }
+        _rpcPromiseMap.delete(id);
+        _streamMap.delete(id);
+      }, timeout);
+
+    // For node.js, `unref` is not available in browser-like environments
+    if (typeof responseTimeoutId === "object")
+      responseTimeoutId = responseTimeoutId.unref?.();
+
+    return responseTimeoutId;
+  }
 
   async function _call(
     method: string,
@@ -307,31 +402,47 @@ export function createBirpc<
 
     const id = nanoid();
     req.i = id;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let ackTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    let responseTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
     async function handler(newReq: RpcRequest = req) {
-      if (timeout >= 0) {
-        timeoutId = setTimeout(() => {
+      const entry: PromiseEntry = {
+        resolve,
+        reject,
+        method,
+        ackReceived: !ackTimeout, // If no ack required, mark as already received
+      };
+
+      // If ackTimeout is set, start ack timer; response timer starts after ack
+      if (ackTimeout !== undefined && ackTimeout >= 0) {
+        ackTimeoutId = setTimeout(() => {
           try {
-            // Custom onTimeoutError handler can throw its own error too
-            const handleResult = options.onTimeoutError?.call(
+            const handleResult = options.onAckTimeoutError?.call(
               rpc,
               method,
               args,
             );
             if (handleResult !== true)
-              throw new Error(`[birpc] timeout on calling "${method}"`);
+              throw new Error(
+                `[birpc] ack timeout on calling "${method}" - message may not have been received`,
+              );
           } catch (e) {
             reject(e);
           }
           _rpcPromiseMap.delete(id);
-        }, timeout);
+        }, ackTimeout);
 
-        // For node.js, `unref` is not available in browser-like environments
-        if (typeof timeoutId === "object") timeoutId = timeoutId.unref?.();
+        if (typeof ackTimeoutId === "object")
+          ackTimeoutId = ackTimeoutId.unref?.();
+
+        entry.ackTimeoutId = ackTimeoutId;
+      } else {
+        // No ack required, start response timeout immediately
+        responseTimeoutId = startResponseTimeout(id, method, args, reject);
+        entry.responseTimeoutId = responseTimeoutId;
       }
 
-      _rpcPromiseMap.set(id, { resolve, reject, timeoutId, method });
+      _rpcPromiseMap.set(id, entry);
       await send(newReq);
       return promise;
     }
@@ -344,11 +455,180 @@ export function createBirpc<
       if (options.onGeneralError?.call(rpc, e as Error) !== true) throw e;
       return;
     } finally {
-      clearTimeout(timeoutId);
+      clearTimeout(ackTimeoutId);
+      clearTimeout(responseTimeoutId);
       _rpcPromiseMap.delete(id);
     }
 
     return promise;
+  }
+
+  function _callStream<T = unknown>(
+    method: string,
+    args: unknown[],
+  ): AsyncIterable<T> {
+    const queue: T[] = [];
+    let done = false;
+    let error: any;
+    let resolver: (() => void) | null = null;
+    let started = false;
+    let startError: Error | null = null;
+
+    const id = nanoid();
+
+    const streamEntry: StreamEntry = {
+      push: (value: T) => {
+        queue.push(value);
+        resolver?.();
+      },
+      end: () => {
+        done = true;
+        resolver?.();
+      },
+      error: (e: any) => {
+        error = e;
+        resolver?.();
+      },
+    };
+
+    // Start the call lazily when iteration begins
+    async function startCall() {
+      if (started) return;
+      started = true;
+
+      if ($closed) {
+        startError = new Error(
+          `[birpc] rpc is closed, cannot call "${method}"`,
+        );
+        return;
+      }
+
+      const req: RpcRequest = { m: method, a: args, t: TYPE_REQUEST, i: id };
+
+      try {
+        // Wait for init promise if needed
+        if (_promiseInit) {
+          try {
+            await _promiseInit;
+          } finally {
+            _promiseInit = undefined;
+          }
+        }
+
+        // Set up ack handling if needed
+        if (ackTimeout !== undefined && ackTimeout >= 0) {
+          let ackTimeoutId: ReturnType<typeof setTimeout> | undefined =
+            setTimeout(() => {
+              try {
+                const handleResult = options.onAckTimeoutError?.call(
+                  rpc,
+                  method,
+                  args,
+                );
+                if (handleResult !== true) {
+                  streamEntry.error(
+                    new Error(
+                      `[birpc] ack timeout on calling "${method}" - message may not have been received`,
+                    ),
+                  );
+                }
+              } catch (e) {
+                streamEntry.error(e);
+              }
+              _rpcPromiseMap.delete(id);
+            }, ackTimeout);
+
+          if (typeof ackTimeoutId === "object")
+            ackTimeoutId = ackTimeoutId.unref?.();
+
+          _rpcPromiseMap.set(id, {
+            resolve: () => {},
+            reject: streamEntry.error,
+            method,
+            ackTimeoutId,
+            ackReceived: false,
+          });
+        } else {
+          // No ack required, set up response timeout for stream
+          if (timeout >= 0) {
+            let streamTimeoutId: ReturnType<typeof setTimeout> | undefined =
+              setTimeout(() => {
+                try {
+                  const handleResult = options.onTimeoutError?.call(
+                    rpc,
+                    method,
+                    args,
+                  );
+                  if (handleResult !== true) {
+                    streamEntry.error(
+                      new Error(`[birpc] timeout on calling "${method}"`),
+                    );
+                  }
+                } catch (e) {
+                  streamEntry.error(e);
+                }
+                _streamMap.delete(id);
+              }, timeout);
+
+            if (typeof streamTimeoutId === "object")
+              streamTimeoutId = streamTimeoutId.unref?.();
+
+            streamEntry.timeoutId = streamTimeoutId;
+          }
+        }
+
+        _streamMap.set(id, streamEntry);
+        await post(serialize(req));
+      } catch (e) {
+        startError = e as Error;
+        _streamMap.delete(id);
+        _rpcPromiseMap.delete(id);
+      }
+    }
+
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<T> {
+        return {
+          async next(): Promise<IteratorResult<T>> {
+            // Start the call on first iteration
+            await startCall();
+
+            if (startError) {
+              throw startError;
+            }
+
+            // Wait for data
+            while (queue.length === 0 && !done && !error) {
+              await new Promise<void>((r) => {
+                resolver = r;
+              });
+              resolver = null;
+            }
+
+            if (error) {
+              _streamMap.delete(id);
+              _rpcPromiseMap.delete(id);
+              throw error;
+            }
+
+            if (done && queue.length === 0) {
+              _streamMap.delete(id);
+              _rpcPromiseMap.delete(id);
+              return { done: true, value: undefined };
+            }
+
+            return { done: false, value: queue.shift()! };
+          },
+          async return(): Promise<IteratorResult<T>> {
+            // Cleanup on early termination
+            _streamMap.delete(id);
+            _rpcPromiseMap.delete(id);
+            done = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
   }
 
   const builtinMethods = {
@@ -359,6 +639,8 @@ export function createBirpc<
       _call(method, args, true),
     $callRaw: (options: CallRawOptions) =>
       _call(options.method, options.args, options.event, options.optional),
+    $callStream: (method: string, ...args: unknown[]) =>
+      _callStream(method, args),
     $rejectPendingCalls,
     get $closed() {
       return $closed;
@@ -387,12 +669,15 @@ export function createBirpc<
             return undefined;
 
           const sendEvent = (...args: any[]) => _call(method, args, true);
+          const sendStream = (...args: any[]) => _callStream(method, args);
           if (eventNames.includes(method as any)) {
             sendEvent.asEvent = sendEvent;
+            sendEvent.asStream = sendStream;
             return sendEvent;
           }
           const sendCall = (...args: any[]) => _call(method, args, false);
           sendCall.asEvent = sendEvent;
+          sendCall.asStream = sendStream;
           return sendCall;
         },
       },
@@ -407,17 +692,33 @@ export function createBirpc<
 
   function $close(customError?: Error) {
     $closed = true;
-    _rpcPromiseMap.forEach(({ reject, method }) => {
-      const error = new Error(`[birpc] rpc is closed, cannot call "${method}"`);
+    _rpcPromiseMap.forEach(
+      ({ reject, method, ackTimeoutId, responseTimeoutId }) => {
+        clearTimeout(ackTimeoutId);
+        clearTimeout(responseTimeoutId);
+        const error = new Error(
+          `[birpc] rpc is closed, cannot call "${method}"`,
+        );
 
-      if (customError) {
-        customError.cause ??= error;
-        return reject(customError);
-      }
+        if (customError) {
+          customError.cause ??= error;
+          return reject(customError);
+        }
 
-      reject(error);
-    });
+        reject(error);
+      },
+    );
     _rpcPromiseMap.clear();
+
+    // Clean up streams
+    _streamMap.forEach((stream) => {
+      clearTimeout(stream.timeoutId);
+      stream.error(
+        customError || new Error("[birpc] rpc is closed, stream terminated"),
+      );
+    });
+    _streamMap.clear();
+
     off(onMessage);
   }
 
@@ -448,7 +749,23 @@ export function createBirpc<
     }
 
     if (msg.t === TYPE_REQUEST) {
-      const { m: method, a: args, o: optional } = msg;
+      const { m: method, a: args, o: optional, i: requestId } = msg;
+
+      // Send ACK immediately if request has an ID (caller may be waiting for ack)
+      if (requestId) {
+        try {
+          await post(
+            serialize(<RpcAck>{ t: TYPE_ACK, i: requestId }),
+            ...extra,
+          );
+        } catch (e) {
+          if (
+            options.onGeneralError?.call(rpc, e as Error, method, args) !== true
+          )
+            throw e;
+        }
+      }
+
       let result, error: any;
       let fn = await (resolver
         ? resolver.call(rpc, method, ($functions as any)[method])
@@ -466,17 +783,65 @@ export function createBirpc<
         }
       }
 
-      if (msg.i) {
+      if (requestId) {
         if (error && options.onFunctionError) {
           if (options.onFunctionError.call(rpc, error, method, args) === true)
             return;
         }
 
-        // Send data
+        // Check if result is an async iterator for streaming
+        if (!error && isAsyncIterable(result)) {
+          try {
+            for await (const value of result) {
+              await post(
+                serialize(<RpcStreamNext>{
+                  t: TYPE_STREAM_NEXT,
+                  i: requestId,
+                  v: value,
+                }),
+                ...extra,
+              );
+            }
+            await post(
+              serialize(<RpcStreamEnd>{ t: TYPE_STREAM_END, i: requestId }),
+              ...extra,
+            );
+            return;
+          } catch (e) {
+            // Send stream error
+            try {
+              await post(
+                serialize(<RpcStreamError>{
+                  t: TYPE_STREAM_ERROR,
+                  i: requestId,
+                  e,
+                }),
+                ...extra,
+              );
+            } catch (sendError) {
+              if (
+                options.onGeneralError?.call(
+                  rpc,
+                  sendError as Error,
+                  method,
+                  args,
+                ) !== true
+              )
+                throw sendError;
+            }
+            return;
+          }
+        }
+
+        // Send regular response
         if (!error) {
           try {
             await post(
-              serialize(<RpcResponse>{ t: TYPE_RESPONSE, i: msg.i, r: result }),
+              serialize(<RpcResponse>{
+                t: TYPE_RESPONSE,
+                i: requestId,
+                r: result,
+              }),
               ...extra,
             );
             return;
@@ -492,7 +857,11 @@ export function createBirpc<
         // Try to send error if serialization failed
         try {
           await post(
-            serialize(<RpcResponse>{ t: TYPE_RESPONSE, i: msg.i, e: error }),
+            serialize(<RpcResponse>{
+              t: TYPE_RESPONSE,
+              i: requestId,
+              e: error,
+            }),
             ...extra,
           );
         } catch (e) {
@@ -502,11 +871,63 @@ export function createBirpc<
             throw e;
         }
       }
-    } else {
+    } else if (msg.t === TYPE_ACK) {
+      // Handle ACK message
+      const { i: ackId } = msg;
+      const entry = _rpcPromiseMap.get(ackId);
+      if (entry && !entry.ackReceived) {
+        clearTimeout(entry.ackTimeoutId);
+        entry.ackReceived = true;
+        // Now start response timeout
+        entry.responseTimeoutId = startResponseTimeout(
+          ackId,
+          entry.method,
+          [], // args not available here, using empty array
+          entry.reject,
+        );
+      }
+    } else if (msg.t === TYPE_STREAM_NEXT) {
+      // Handle stream next value
+      const { i: streamId, v: value } = msg;
+      const stream = _streamMap.get(streamId);
+      if (stream) {
+        stream.push(value);
+      }
+    } else if (msg.t === TYPE_STREAM_END) {
+      // Handle stream end
+      const { i: streamId } = msg;
+      const stream = _streamMap.get(streamId);
+      const entry = _rpcPromiseMap.get(streamId);
+      if (stream) {
+        clearTimeout(stream.timeoutId);
+        stream.end();
+        _streamMap.delete(streamId);
+      }
+      if (entry) {
+        clearTimeout(entry.responseTimeoutId);
+        _rpcPromiseMap.delete(streamId);
+      }
+    } else if (msg.t === TYPE_STREAM_ERROR) {
+      // Handle stream error
+      const { i: streamId, e: error } = msg;
+      const stream = _streamMap.get(streamId);
+      const entry = _rpcPromiseMap.get(streamId);
+      if (stream) {
+        clearTimeout(stream.timeoutId);
+        stream.error(error);
+        _streamMap.delete(streamId);
+      }
+      if (entry) {
+        clearTimeout(entry.responseTimeoutId);
+        _rpcPromiseMap.delete(streamId);
+      }
+    } else if (msg.t === TYPE_RESPONSE) {
+      // Handle regular response
       const { i: ack, r: result, e: error } = msg;
       const promise = _rpcPromiseMap.get(ack);
       if (promise) {
-        clearTimeout(promise.timeoutId);
+        clearTimeout(promise.ackTimeoutId);
+        clearTimeout(promise.responseTimeoutId);
 
         if (error) promise.reject(error);
         else promise.resolve(result);

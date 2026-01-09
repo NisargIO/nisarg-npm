@@ -40,3 +40,17 @@ export function nanoid(size = 21) {
   while (i--) id += urlAlphabet[(random() * 64) | 0];
   return id;
 }
+
+/**
+ * Check if a value is an async iterable
+ */
+export function isAsyncIterable(
+  value: unknown,
+): value is AsyncIterable<unknown> {
+  return (
+    value != null &&
+    typeof value === "object" &&
+    Symbol.asyncIterator in value &&
+    typeof (value as any)[Symbol.asyncIterator] === "function"
+  );
+}
